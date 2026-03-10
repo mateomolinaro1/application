@@ -1,6 +1,5 @@
 """
 Prediction de la survie d'un individu sur le Titanic
-(avec GridSearchCV + cross-validation)
 """
 
 import os
@@ -11,7 +10,7 @@ from dotenv import load_dotenv
 from sklearn.preprocessing import OneHotEncoder
 from sklearn.impute import SimpleImputer
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.model_selection import train_test_split, GridSearchCV, StratifiedKFold
+from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.ensemble import RandomForestClassifier
@@ -26,6 +25,7 @@ from src.validation.check import (
     check_data_leakage,
 )
 
+
 load_dotenv()
 con = duckdb.connect(database=":memory:")
 
@@ -37,35 +37,30 @@ logging.basicConfig(
     handlers=[logging.FileHandler("recording.log"), logging.StreamHandler()],
 )
 
+
 # PARAMETERS ---------------------------------------
 
+
+N_TREES = 20
+MAX_DEPTH = None
+MAX_FEATURES = "sqrt"
 NUMERIC_FEATURES = ["Age", "Fare"]
 CATEGORICAL_FEATURES = ["Embarked", "Sex"]
 URL_RAW = "https://minio.lab.sspcloud.fr/lgaliana/ensae-reproductibilite/data/raw/data.parquet"
 
 jeton_api = os.environ["JETON_API"]
 
+
 # ENVIRONMENT CONFIGURATION ---------------------------
 
-parser = argparse.ArgumentParser(
-    description="Paramètres du random forest + grid search"
-)
-parser.add_argument(
-    "--n_trees",
-    type=int,
-    default=20,
-    help="Valeur par défaut pour n_estimators dans la grille",
-)
-parser.add_argument(
-    "--cv", type=int, default=5, help="Nombre de folds pour la cross-validation"
-)
+parser = argparse.ArgumentParser(description="Paramètres du random forest")
+parser.add_argument("--n_trees", type=int, default=20, help="Nombre d'arbres")
 args = parser.parse_args()
 
-n_trees_default = args.n_trees
-cv_folds = args.cv
+n_trees = args.n_trees
 
-logging.debug(f"Valeur de l'argument n_trees: {n_trees_default}")
-logging.debug(f"Valeur de l'argument cv: {cv_folds}")
+logging.debug(f"Valeur de l'argument n_trees: {n_trees}")
+
 
 # QUALITY DIAGNOSTICS  ---------------------------------------
 
@@ -78,12 +73,13 @@ con.sql(query_definition)
 
 column_names = con.sql("SELECT column_name FROM (DESCRIBE titanic)").to_df()[
     "column_name"
-]
+]  # DuckDB ici, sinon titanic.columns serait OK
 
 check_name_formatting(connection=con)
 
 for var in column_names:
     check_missing_values(connection=con, variable=var)
+
 
 # FEATURE ENGINEERING    -----------------------------------------
 
@@ -96,13 +92,11 @@ titanic = con.sql(
 y = titanic["Survived"]
 X = titanic.drop("Survived", axis="columns")
 
-# Stratify: utile sur Titanic car classes pas parfaitement équilibrées
-X_train, X_test, y_train, y_test = train_test_split(
-    X, y, test_size=0.1, random_state=42, stratify=y
-)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.1)
 
 for string_var in CATEGORICAL_FEATURES:
     check_data_leakage(X_train, X_test, string_var)
+
 
 # MODEL DEFINITION -----------------------------------------
 
@@ -116,72 +110,49 @@ numeric_transformer = Pipeline(
 categorical_transformer = Pipeline(
     steps=[
         ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("onehot", OneHotEncoder(handle_unknown="ignore")),
+        ("onehot", OneHotEncoder()),
     ]
 )
+
 
 preprocessor = ColumnTransformer(
     transformers=[
         ("Preprocessing numerical", numeric_transformer, NUMERIC_FEATURES),
-        ("Preprocessing categorical", categorical_transformer, CATEGORICAL_FEATURES),
+        (
+            "Preprocessing categorical",
+            categorical_transformer,
+            CATEGORICAL_FEATURES,
+        ),
     ]
 )
 
 pipe = Pipeline(
-    steps=[
+    [
         ("preprocessor", preprocessor),
-        ("classifier", RandomForestClassifier(random_state=42)),
+        (
+            "classifier",
+            RandomForestClassifier(
+                n_estimators=N_TREES, max_depth=MAX_DEPTH, max_features=MAX_FEATURES
+            ),
+        ),
     ]
-)
-
-# GRID SEARCH + CV --------------------------------------------
-
-# Grille d'hyperparamètres (tu peux l'élargir/réduire selon le temps de calcul)
-param_grid = {
-    "classifier__n_estimators": [
-        n_trees_default,
-    ],
-    "classifier__max_depth": [3, 5],
-    "classifier__max_features": ["sqrt", "log2"],
-    "classifier__min_samples_split": [2, 5]
-}
-
-cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=42)
-
-search = GridSearchCV(
-    estimator=pipe,
-    param_grid=param_grid,
-    scoring="accuracy",
-    cv=cv,
-    verbose=1,
-    refit=True,
 )
 
 # TRAINING AND EVALUATION --------------------------------------------
 
-logging.debug(f"\n{80 * '-'}\nStarting grid search fitting phase\n{80 * '-'}")
+logging.debug(f"\n{80 * '-'}\nStarting model fitting phase\n{80 * '-'}")
 
-search.fit(X_train, y_train)
+pipe.fit(X_train, y_train)
+obj = sio.dump(pipe, "model.skops")
 
-logging.info(f"Best CV score: {search.best_score_:.3f}")
-logging.info(f"Best params: {search.best_params_}")
-
-best_model = search.best_estimator_
-
-# Sauvegarde du meilleur pipeline complet
-sio.dump(best_model, "model.skops")
-
-test_score = best_model.score(X_test, y_test)
-train_score = best_model.score(X_train, y_train)
+rdmf_score = pipe.score(X_test, y_test)
+rdmf_score_tr = pipe.score(X_train, y_train)
 
 logging.info(
-    f"{test_score:.1%} de bonnes réponses sur les données de test (best model)"
-)
-logging.info(
-    f"{train_score:.1%} de bonnes réponses sur les données de train (best model)"
+    f"{rdmf_score:.1%} de bonnes réponses sur les données de test pour validation"
 )
 
-logging.info("Matrice de confusion (test):")
-logging.info(confusion_matrix(y_test, best_model.predict(X_test)))
+logging.info("Matrice de confusion:")
+logging.info(confusion_matrix(y_test, pipe.predict(X_test)))
 
 logging.debug(f"\n{80 * '-'}\nFILE ENDED SUCCESSFULLY!\n{80 * '-'}")
