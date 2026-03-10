@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
       - name: titanic
-        image: compte_github/application:latest
+        image: mateomolinaro1/application:latest
         ports:
         - containerPort: 8000
         env:
